@@ -12,24 +12,27 @@ import {
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
-// 1. Signals para busca (Performance fluida nos inputs)
 import { signal } from "@preact/signals-react";
 import { useSignals } from "@preact/signals-react/runtime";
+import { useQuery, useMutation } from "@tanstack/react-query";
+
+// Imports de Imagens para o Leaflet
+import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
+import markerIcon from "leaflet/dist/images/marker-icon.png";
+import markerShadow from "leaflet/dist/images/marker-shadow.png";
 
 const cepSignal = signal("");
 const numeroSignal = signal("");
 const loadingSignal = signal(false);
 
-// 2. Configuração de Ícones do Leaflet
-import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
-import markerIcon from "leaflet/dist/images/marker-icon.png";
-import markerShadow from "leaflet/dist/images/marker-shadow.png";
-
-delete (L.Icon.Default.prototype as any)._getIconUrl;
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: markerIcon2x,
+const defaultIcon = new L.Icon({
   iconUrl: markerIcon,
+  iconRetinaUrl: markerIcon2x,
   shadowUrl: markerShadow,
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+  popupAnchor: [1, -34], // Ajustado para brotar exatamente na ponta
+  tooltipAnchor: [16, -28],
 });
 
 const homeIcon = new L.Icon({
@@ -50,17 +53,77 @@ interface CustomMarker {
 }
 
 export default function App() {
-  useSignals(); // Habilita o rastreamento de Signals
-
-  // Estados principais
+  useSignals();
   const [markers, setMarkers] = useState<CustomMarker[]>([]);
   const [tempPos, setTempPos] = useState<L.LatLng | null>(null);
   const [inputText, setInputText] = useState("");
   const [editingMarker, setEditingMarker] = useState<CustomMarker | null>(null);
-
   const mapRef = useRef<L.Map | null>(null);
 
-  // --- Helpers do Mapa ---
+  // Força o Leaflet a recalcular posições sempre que o marcador temporário ou o texto mudar
+  useEffect(() => {
+    if (mapRef.current) {
+      // Esse comando força o Leaflet a redesenhar todos os componentes internos (popups/markers)
+      mapRef.current.invalidateSize();
+    }
+  }, [tempPos, inputText, editingMarker]);
+
+  const { refetch: buscarEndereco } = useQuery({
+    queryKey: ["cep", cepSignal.value],
+    queryFn: async () => {
+      const cleanCEP = cepSignal.value.replace(/\D/g, "");
+      const res = await fetch(`https://viacep.com.br/ws/${cleanCEP}/json/`);
+      const data = await res.json();
+      if (data.erro) throw new Error("CEP não encontrado");
+      return data;
+    },
+    enabled: false,
+    staleTime: 1000 * 60 * 10,
+  });
+
+  const geocodeMutation = useMutation({
+    mutationFn: async (query: string) => {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`,
+      );
+      return res.json();
+    },
+    onSuccess: (geoData) => {
+      if (geoData.length > 0) {
+        const newPos = new L.LatLng(
+          parseFloat(geoData[0].lat),
+          parseFloat(geoData[0].lon),
+        );
+        setTempPos(null);
+        mapRef.current?.flyTo(newPos, 16, { animate: true, duration: 1.5 });
+
+        // O moveend garante que o Popup só abra quando o mapa parar, evitando que ele "descole"
+        mapRef.current?.once("moveend", () => {
+          setTempPos(newPos);
+          mapRef.current?.invalidateSize();
+        });
+      }
+    },
+  });
+
+  const localizarCEP = async () => {
+    const cleanCEP = cepSignal.value.replace(/\D/g, "");
+    if (cleanCEP.length < 8) return;
+    loadingSignal.value = true;
+    try {
+      const { data: apiData } = await buscarEndereco();
+      if (apiData) {
+        const endereco = `${apiData.logradouro}, ${numeroSignal.value} - ${apiData.localidade}`;
+        setInputText(endereco);
+        geocodeMutation.mutate(
+          `${apiData.logradouro}, ${numeroSignal.value}, ${apiData.localidade}, ${apiData.uf}, Brasil`,
+        );
+      }
+    } finally {
+      loadingSignal.value = false;
+    }
+  };
+
   function MapInitializer() {
     const map = useMap();
     useEffect(() => {
@@ -80,51 +143,6 @@ export default function App() {
     return null;
   }
 
-  // --- Lógica de Busca por CEP ---
-  const localizarCEP = async () => {
-    const cleanCEP = cepSignal.value.replace(/\D/g, "");
-    if (cleanCEP.length < 8) return;
-
-    loadingSignal.value = true;
-    try {
-      // Busca endereço
-      const res = await fetch(`https://viacep.com.br/ws/${cleanCEP}/json/`);
-      const data = await res.json();
-
-      if (data.error) {
-        alert("CEP não encontrado.");
-        return;
-      }
-
-      const query = `${data.logradouro}, ${numeroSignal.value}, ${data.localidade}, ${data.uf}, Brasil`;
-      const geoRes = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`,
-      );
-      const geoData = await geoRes.json();
-
-      if (geoData.length > 0) {
-        const newPos = new L.LatLng(
-          parseFloat(geoData[0].lat),
-          parseFloat(geoData[0].lon),
-        );
-        const enderecoFormatado = `${data.logradouro}, ${numeroSignal.value} - ${data.localidade}`;
-
-        mapRef.current?.flyTo(newPos, 16);
-        setTempPos(newPos);
-
-        // Injeta o endereço no texto do marcador automaticamente
-        setInputText(enderecoFormatado);
-      } else {
-        alert("Endereço encontrado, mas não conseguimos obter as coordenadas.");
-      }
-    } catch (err) {
-      alert("Erro na conexão.");
-    } finally {
-      loadingSignal.value = false;
-    }
-  };
-
-  // --- Operações de Marcadores ---
   const saveOrUpdateMarker = () => {
     if (editingMarker) {
       setMarkers((prev) =>
@@ -143,17 +161,6 @@ export default function App() {
     setInputText("");
   };
 
-  const deleteMarker = (id: number) =>
-    setMarkers((prev) => prev.filter((m) => m.id !== id));
-
-  const startEdit = (marker: CustomMarker) => {
-    setEditingMarker(marker);
-    setInputText(marker.text);
-    setTempPos(null);
-    mapRef.current?.panTo(marker.position as L.LatLngExpression);
-  };
-
-  // Cálculo da posição do formulário na tela
   const getFormPosition = () => {
     if (!mapRef.current || (!tempPos && !editingMarker))
       return { display: "none" };
@@ -173,23 +180,24 @@ export default function App() {
   return (
     <div className="app-container">
       <div className="map-area">
-        <MapContainer center={INITIAL_CENTER} zoom={13} className="leaflet-map">
+        <MapContainer
+          center={INITIAL_CENTER}
+          zoom={13}
+          className="leaflet-map"
+          trackResize={true}
+        >
           <MapInitializer />
           <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
           <ClickHandler />
 
-          {/* Marcador Home */}
           <Marker position={INITIAL_CENTER} icon={homeIcon}>
             <Tooltip direction="top">FITec Labs</Tooltip>
-            <Popup>Minha Casa (Ponto Inicial)</Popup>
+            <Popup>Ponto Inicial</Popup>
           </Marker>
 
-          {/* Lista de Marcadores */}
           {markers.map((m) => (
-            <Marker key={m.id} position={m.position}>
-              <Tooltip direction="top" offset={[0, -32]}>
-                {m.text}
-              </Tooltip>
+            <Marker key={m.id} position={m.position} icon={defaultIcon}>
+              <Tooltip direction="top">{m.text}</Tooltip>
               <Popup>
                 <strong>Marcador:</strong>
                 <br />
@@ -198,16 +206,32 @@ export default function App() {
             </Marker>
           ))}
 
-          {/* Prévia do Marcador (Usado na Busca ou Clique) */}
           {tempPos && (
-            <Marker position={tempPos}>
-              <Tooltip permanent direction="top" offset={[0, -32]}>
+            <Marker
+              position={tempPos}
+              icon={defaultIcon}
+              eventHandlers={{
+                add: (e) => {
+                  // Sem o delay, ele tenta abrir antes do marcador existir no DOM do Leaflet
+                  setTimeout(() => e.target.openPopup(), 100);
+                },
+              }}
+            >
+              <Tooltip permanent direction="top">
                 {inputText || "Novo Ponto"}
               </Tooltip>
-              <Popup autoClose={false}>
-                <strong>Endereço Encontrado:</strong>
-                <br />
-                {inputText || "Defina um nome ou confirme o endereço"}
+              {/* O segredo está aqui: autoPan={false} e keepInView={false} */}
+              <Popup
+                autoPan={false}
+                keepInView={false}
+                closeButton={false}
+                offset={[0, -10]}
+              >
+                <div style={{ textAlign: "center", minWidth: "140px" }}>
+                  <strong>Localizado!</strong>
+                  <br />
+                  {inputText}
+                </div>
               </Popup>
             </Marker>
           )}
@@ -219,9 +243,9 @@ export default function App() {
             <input
               type="text"
               value={inputText}
+              placeholder="Descrição do local"
               onChange={(e) => setInputText(e.target.value)}
               className="form-input"
-              placeholder="Nome ou endereço do local"
             />
             <div className="form-buttons">
               <button onClick={saveOrUpdateMarker} className="btn-save">
@@ -250,19 +274,23 @@ export default function App() {
               placeholder="CEP"
               value={cepSignal.value}
               onChange={(e) => (cepSignal.value = e.target.value)}
+              style={{ padding: 8 }}
             />
             <input
               type="text"
               placeholder="Número"
               value={numeroSignal.value}
               onChange={(e) => (numeroSignal.value = e.target.value)}
+              style={{ padding: 8 }}
             />
             <button
               onClick={localizarCEP}
-              disabled={loadingSignal.value}
+              disabled={loadingSignal.value || geocodeMutation.isPending}
               className="btn-search"
             >
-              {loadingSignal.value ? "Pesquisando..." : "Localizar"}
+              {loadingSignal.value || geocodeMutation.isPending
+                ? "Buscando..."
+                : "Localizar"}
             </button>
             <button
               onClick={() => mapRef.current?.flyTo(INITIAL_CENTER, 15)}
@@ -272,20 +300,28 @@ export default function App() {
             </button>
           </div>
         </div>
-
         <hr className="divider" />
-
-        <h3>Meus Locais ({markers.length})</h3>
+        <h3 style={{ color: "black" }}>Meus Locais ({markers.length})</h3>
         <ul className="marker-list">
           {markers.map((m) => (
             <li key={m.id} className="marker-item">
-              <span title={m.text}>{m.text}</span>
+              <span className="marker-info">{m.text}</span>
               <div className="marker-actions">
-                <button onClick={() => startEdit(m)} className="btn-edit">
+                <button
+                  onClick={() => {
+                    setEditingMarker(m);
+                    setInputText(m.text);
+                    setTempPos(null);
+                    mapRef.current?.flyTo(m.position as L.LatLng, 16);
+                  }}
+                  className="btn-edit"
+                >
                   e
                 </button>
                 <button
-                  onClick={() => deleteMarker(m.id)}
+                  onClick={() =>
+                    setMarkers((prev) => prev.filter((x) => x.id !== m.id))
+                  }
                   className="btn-delete"
                 >
                   x
